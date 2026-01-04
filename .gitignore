@@ -39,3 +39,24 @@
 
 # debug information files
 *.dwo
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Benchmark outputs / scratch
+bench/out/
+bench/tmpdata*/
+bench/**/*.log
+bench/**/*.tmp
+
+# Data / runs (generated)
+data/
+runs/
+
+# DiskANN artifacts
+*.bin
+*.index
+*.pq
+*.vamana
