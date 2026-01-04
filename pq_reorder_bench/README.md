@@ -1,4 +1,4 @@
-# diskann-pg/bench
+# diskann-pg/pq_reorder_bench
 
 这个目录放一些可复现的 benchmark 脚本。
 
@@ -55,7 +55,7 @@ $APPS/utils/rand_data_gen --data_type float --output_file tmpdata/query_f32.bin 
 用 wrapper 脚本：
 
 ```bash
-cd diskann-pg/bench
+cd diskann-pg/pq_reorder_bench
 chmod +x run_pq_reorder_bench.sh
 
 ./run_pq_reorder_bench.sh \
@@ -73,7 +73,7 @@ chmod +x run_pq_reorder_bench.sh
 ### 1.4 直接运行 Python（更灵活）
 
 ```bash
-cd diskann-pg/bench
+cd diskann-pg/pq_reorder_bench
 
 python3 pq_reorder_bench.py \
   --diskann-apps /home/xtang/DiskANN-epeshared/build/apps \
@@ -101,7 +101,7 @@ python3 pq_reorder_bench.py \
 - `--diskann-apps`：DiskANN 的 apps 目录（包含 `build_disk_index` / `search_disk_index`）。不传时会尝试自动探测。
 - `--base-f32`：float32 base 向量 `.bin`
 - `--query-f32`：float32 query 向量 `.bin`
-- `--workdir`：输出根目录，默认 `diskann-pg/bench/out`
+- `--workdir`：输出根目录，默认 `diskann-pg/pq_reorder_bench/out`
 - `--tag`：run 目录后缀标签，便于区分实验
 
 ### 2.2 距离函数
@@ -231,7 +231,7 @@ python3 pq_reorder_bench.py \
 ### 运行示例
 
 ```bash
-cd diskann-pg/bench
+cd diskann-pg/pq_reorder_bench
 chmod +x run_pq_reorder_bench.sh
 
 ./run_pq_reorder_bench.sh \
@@ -244,7 +244,7 @@ chmod +x run_pq_reorder_bench.sh
   --threads 32
 ```
 
-输出会打印 `summary.json` 的路径，默认在 `diskann-pg/bench/out/<timestamp>_pq_reorder/summary.json`。
+输出会打印 `summary.json` 的路径，默认在 `diskann-pg/pq_reorder_bench/out/<timestamp>_pq_reorder/summary.json`。
 
 ### 依赖
 
