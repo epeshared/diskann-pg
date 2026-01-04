@@ -6,6 +6,9 @@
 
 脚本：`pq_reorder_bench.py`
 
+> 重要：该脚本 **只测试 SSD/disk index** 路径（`build_disk_index` + `search_disk_index`）。
+> 不包含 in-memory index（`build_memory_index`/`search_memory_index`）的性能评估。
+
 它会：
 
 - 输入 float32 的 base/query（DiskANN `.bin` 格式）
@@ -59,8 +62,8 @@ cd diskann-pg/pq_reorder_bench
 chmod +x run_pq_reorder_bench.sh
 
 ./run_pq_reorder_bench.sh \
-  --base-f32 ../data/rand_float_768D_1M_norm1.0.bin \
-  --query-f32 ../data/rand_float_768D_10K_norm1.0.bin \
+  --base-f32 tmpdata/rand_float_768D_1M_norm1.0.bin \
+  --query-f32 tmpdata/rand_float_768D_10K_norm1.0.bin \
   --dist l2 \
   --K 10 \
   --Ls 10 20 30 40 50 100 \
@@ -77,8 +80,8 @@ cd diskann-pg/pq_reorder_bench
 
 python3 pq_reorder_bench.py \
   --diskann-apps /home/xtang/DiskANN-epeshared/build/apps \
-  --base-f32 /path/to/base_f32.bin \
-  --query-f32 /path/to/query_f32.bin \
+  --base-f32 tmpdata/base_f32.bin \
+  --query-f32 tmpdata/query_f32.bin \
   --dist l2 \
   --K 10 \
   --Ls 10 20 30 \
@@ -111,6 +114,8 @@ python3 pq_reorder_bench.py \
 
 ### 2.3 Index build（DiskANN build_disk_index）
 
+> 本节的 build 参数只适用于 **disk index（SSD）**：脚本调用的是 `build_disk_index`，不会调用 `build_memory_index`。
+
 这些参数会传给 `build_disk_index`：
 
 - `--R`：图的最大度（`-R/--max_degree`）
@@ -126,6 +131,8 @@ python3 pq_reorder_bench.py \
 - dtype=int8：不会加 `--append_reorder_data`（DiskANN 不支持 int8 reorder）。
 
 ### 2.4 Search（DiskANN search_disk_index）
+
+> 本节的 search 参数只适用于 **disk index（SSD）**：脚本调用的是 `search_disk_index`，不会调用 `search_memory_index`。
 
 这些参数会传给 `search_disk_index`：
 
@@ -235,8 +242,8 @@ cd diskann-pg/pq_reorder_bench
 chmod +x run_pq_reorder_bench.sh
 
 ./run_pq_reorder_bench.sh \
-  --base-f32 ../data/rand_float_768D_1M_norm1.0.bin \
-  --query-f32 ../data/rand_float_768D_10K_norm1.0.bin \
+  --base-f32 tmpdata/rand_float_768D_1M_norm1.0.bin \
+  --query-f32 tmpdata/rand_float_768D_10K_norm1.0.bin \
   --dist l2 \
   --K 10 \
   --Ls 10 20 30 40 50 100 \

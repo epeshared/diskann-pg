@@ -132,20 +132,20 @@ def _find_diskann_apps_dir(explicit: Optional[str]) -> Path:
             raise FileNotFoundError(f"diskann apps dir not found: {p}")
         return p
 
-    # Heuristic: common build outputs.
-    candidates = [
-        Path("/home/xtang/DiskANN-epeshared/build/apps"),
-        Path("/home/xtang/DiskANN/build/apps"),
-        Path("/home/xtang/DiskANN/build/tests"),
-    ]
-    for c in candidates:
-        if (c / "build_disk_index").exists() and (c / "search_disk_index").exists():
-            return c
+    # # Heuristic: common build outputs.
+    # candidates = [
+    #     Path("/home/xtang/DiskANN-epeshared/build/apps"),
+    #     Path("/home/xtang/DiskANN/build/apps"),
+    #     Path("/home/xtang/DiskANN/build/tests"),
+    # ]
+    # for c in candidates:
+    #     if (c / "build_disk_index").exists() and (c / "search_disk_index").exists():
+    #         return c
 
-    raise FileNotFoundError(
-        "Could not auto-detect DiskANN apps directory. "
-        "Pass --diskann-apps /path/to/DiskANN/build/apps"
-    )
+    # raise FileNotFoundError(
+    #     "Could not auto-detect DiskANN apps directory. "
+    #     "Pass --diskann-apps /path/to/DiskANN/build/apps"
+    # )
 
 
 def _run(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, float, str]:

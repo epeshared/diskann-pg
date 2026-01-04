@@ -60,3 +60,6 @@ runs/
 *.index
 *.pq
 *.vamana
+tmpdata*/
+out/*
+out

@@ -13,16 +13,16 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY=${PYTHON:-python3}
 
 # Try to auto-detect DiskANN build apps if user didn't pass --diskann-apps.
-DEFAULT_APPS=""
-for c in \
-  "/home/xtang/DiskANN-epeshared/build/apps" \
-  "/home/xtang/DiskANN/build/apps" \
-  "/home/xtang/DiskANN/build/tests"; do
-  if [[ -x "$c/build_disk_index" && -x "$c/search_disk_index" ]]; then
-    DEFAULT_APPS="$c"
-    break
-  fi
-done
+DEFAULT_APPS="/home/xtang/DiskANN-epeshared/build/apps"
+# for c in \
+#   "/home/xtang/DiskANN-epeshared/build/apps" \
+#   "/home/xtang/DiskANN/build/apps" \
+#   "/home/xtang/DiskANN/build/tests"; do
+#   if [[ -x "$c/build_disk_index" && -x "$c/search_disk_index" ]]; then
+#     DEFAULT_APPS="$c"
+#     break
+#   fi
+# done
 
 ARGS=("$@")
 
