@@ -46,10 +46,10 @@ __pycache__/
 .pytest_cache/
 
 # Benchmark outputs / scratch
-bench/out/
-bench/tmpdata*/
-bench/**/*.log
-bench/**/*.tmp
+*_bench/out/
+*_bench/tmpdata*/
+*_bench/**/*.log
+*_bench/**/*.tmp
 
 # Data / runs (generated)
 data/
@@ -63,3 +63,4 @@ runs/
 tmpdata*/
 out/*
 out
+*.log
