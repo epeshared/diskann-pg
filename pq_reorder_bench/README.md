@@ -110,7 +110,8 @@ python3 pq_reorder_bench.py \
 ### 2.2 距离函数
 
 - `--dist`：`l2` / `cosine` / `mips`
-  - DiskANN 限制：`mips` 目前只支持浮点（float/bf16），int8 跑 mips 会失败。
+  - DiskANN 限制：`mips` 的 disk index 路径不支持 `int8`。
+  - `bf16+mips`：上游 DiskANN 默认可能未支持；如果你在本仓库中打了相关补丁（确保 MIPS 预处理文件 dtype 一致），则可以跑通。
 
 ### 2.3 Index build（DiskANN build_disk_index）
 
@@ -123,7 +124,16 @@ python3 pq_reorder_bench.py \
 - `--B`：search_DRAM_budget（GB）
 - `--M`：build_DRAM_budget（GB）
 - `--PQ-disk-bytes`：`--PQ_disk_bytes`，SSD 上的 PQ 压缩字节数（要启用 reorder 必须 > 0）
+- `--QD`：`--QD`，强制覆盖 DiskANN 的 quantized dimension（PQ chunk 数）。
 - `--threads`：并行线程数（build/search 都用这个）
+
+> 强烈建议（尤其是小数据集/quickcheck）：显式设置 `--QD`（例如 `--QD 32`）。
+>
+> 原因：DiskANN 默认会从 `--B/--search_DRAM_budget` 反推一个 chunk 数；在点数很小但 `B` 不小（例如 `B=0.25GB`）时，会推导出非常大的 chunk 数，
+> 进而导致 PQ 训练（kmeans/kmeans++，perf 里常见热点 `kmeanspp_selecting_pivots`）耗时非常长。
+> 对于 `--dist mips`，DiskANN 还会先把 base 预处理成 $d+1$ 维（例如 768 -> 769），会进一步放大这个问题。
+>
+> 经验值：通常可以先设 `--QD = --PQ-disk-bytes`（比如 `--PQ-disk-bytes 32` 配 `--QD 32`），然后再按需要调优。
 
 脚本的策略：
 
@@ -232,6 +242,8 @@ python3 pq_reorder_bench.py \
 ### 3.3 常见问题 / 注意事项
 
 - “为什么 int8 没有 reorder？”：这是 DiskANN CLI 的限制（reorder data 仅支持 float/bf16）。
+- “bf16 build 为什么特别慢，perf 热点是 kmeans++？”：大概率是 PQ 训练在跑（kmeans/kmeans++）。
+  如果你是小数据集/快速验证，请显式设 `--QD`（例如 `--QD 32`），避免 DiskANN 从 `--B` 推导出巨大的 chunk 数导致训练时间爆炸。
 - “跑得很慢/文件很大”：`--PQ-disk-bytes` 越大、`R/Lbuild` 越大，build 时间和 index 体积都会上升。
 - “想复现实验”：保留对应 run 目录即可（里面包含转换后的数据、index、日志、summary）。
 
