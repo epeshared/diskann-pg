@@ -46,11 +46,13 @@ pip install numpy
 如果你没有数据，可用 DiskANN 自带的 `rand_data_gen` 生成：
 
 ```bash
-APPS=/home/xtang/DiskANN-epeshared/build/apps
-mkdir -p tmpdata
+cd diskann-pg/pq_reorder_bench
 
-$APPS/utils/rand_data_gen --data_type float --output_file tmpdata/base_f32.bin -D 768 -N 1000000 --norm 1.0
-$APPS/utils/rand_data_gen --data_type float --output_file tmpdata/query_f32.bin -D 768 -N 10000 --norm 1.0
+# 这个脚本会调用 diskann-pg/bench_data/generate_data.sh
+./generate_data.sh --dim 768 --base-n 1000000 --query-n 10000
+
+# 输出在：diskann-pg/pq_reorder_bench/tmpdata/
+# 例如：tmpdata/base_768_f32_1M.bin / tmpdata/query_768_f32_10K.bin
 ```
 
 ### 1.3 最常用运行方式（推荐）
@@ -61,9 +63,13 @@ $APPS/utils/rand_data_gen --data_type float --output_file tmpdata/query_f32.bin 
 cd diskann-pg/pq_reorder_bench
 chmod +x run_pq_reorder_bench.sh
 
+# 选择 DiskANN build：--isa avx512 或 --isa amx
+# 也可以通过 DISKANN_APPS_DIR 或 --diskann-apps 直接指定 apps 目录
+
 ./run_pq_reorder_bench.sh \
-  --base-f32 tmpdata/rand_float_768D_1M_norm1.0.bin \
-  --query-f32 tmpdata/rand_float_768D_10K_norm1.0.bin \
+  --isa avx512 \
+  --base-f32 tmpdata/base_768_f32_1M.bin \
+  --query-f32 tmpdata/query_768_f32_10K.bin \
   --dist l2 \
   --K 10 \
   --Ls 10 20 30 40 50 100 \
@@ -80,8 +86,8 @@ cd diskann-pg/pq_reorder_bench
 
 python3 pq_reorder_bench.py \
   --diskann-apps /home/xtang/DiskANN-epeshared/build/apps \
-  --base-f32 tmpdata/base_f32.bin \
-  --query-f32 tmpdata/query_f32.bin \
+  --base-f32 tmpdata/base_768_f32_1M.bin \
+  --query-f32 tmpdata/query_768_f32_10K.bin \
   --dist l2 \
   --K 10 \
   --Ls 10 20 30 \
@@ -254,8 +260,8 @@ cd diskann-pg/pq_reorder_bench
 chmod +x run_pq_reorder_bench.sh
 
 ./run_pq_reorder_bench.sh \
-  --base-f32 tmpdata/rand_float_768D_1M_norm1.0.bin \
-  --query-f32 tmpdata/rand_float_768D_10K_norm1.0.bin \
+  --base-f32 tmpdata/base_768_f32_1M.bin \
+  --query-f32 tmpdata/query_768_f32_10K.bin \
   --dist l2 \
   --K 10 \
   --Ls 10 20 30 40 50 100 \

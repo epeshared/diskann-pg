@@ -3,135 +3,33 @@
 import argparse
 import json
 import os
-import re
-import shutil
 import signal
-import struct
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
-# DiskANN .bin format:
-# uint32 npts, uint32 dim, then npts*dim elements of dtype.
+# Allow importing shared utilities from diskann-pg/bench_data when this script is
+# invoked directly.
+_THIS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _THIS_DIR.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-
-@dataclass(frozen=True)
-class BinHeader:
-    npts: int
-    dim: int
+from bench_data.bin_utils import (  # noqa: E402
+    BinHeader,
+    convert_f32_bin_to_bf16_bin,
+    convert_f32_bin_to_int8_bin,
+    read_bin_header as _read_bin_header,
+    require_numpy as _require_numpy,
+)
 
 
 def _log(msg: str) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
-
-
-def _read_bin_header(path: Path) -> BinHeader:
-    with path.open("rb") as f:
-        header = f.read(8)
-        if len(header) != 8:
-            raise ValueError(f"Invalid bin file (too small): {path}")
-        npts, dim = struct.unpack("<II", header)
-        return BinHeader(npts=npts, dim=dim)
-
-
-def _write_bin_header(f, header: BinHeader) -> None:
-    f.write(struct.pack("<II", header.npts, header.dim))
-
-
-def _require_numpy():
-    try:
-        import numpy as np  # noqa: F401
-
-        return np
-    except Exception as e:
-        raise RuntimeError(
-            "This benchmark requires numpy for fast, chunked conversion. "
-            "Install it with: pip install numpy"
-        ) from e
-
-
-def _iter_f32_payload_chunks(path: Path, header: BinHeader, chunk_elems: int):
-    np = _require_numpy()
-    total_elems = header.npts * header.dim
-    with path.open("rb") as f:
-        f.seek(8)
-        remaining = total_elems
-        while remaining > 0:
-            this_elems = min(chunk_elems, remaining)
-            arr = np.fromfile(f, dtype=np.float32, count=this_elems)
-            if arr.size != this_elems:
-                raise IOError(f"Short read when reading payload from {path}")
-            yield arr
-            remaining -= this_elems
-
-
-def convert_f32_bin_to_bf16_bin(src_f32: Path, dst_bf16: Path, chunk_elems: int = 1 << 20) -> None:
-    """Convert float32 .bin to bf16 .bin (payload is uint16 bf16 words).
-
-    DiskANN's bf16 is bfloat16. We convert using round-to-nearest-even (RNE)
-    rather than truncation to reduce quantization error.
-    """
-    np = _require_numpy()
-
-    header = _read_bin_header(src_f32)
-    dst_bf16.parent.mkdir(parents=True, exist_ok=True)
-
-    with dst_bf16.open("wb") as out:
-        _write_bin_header(out, header)
-        for chunk in _iter_f32_payload_chunks(src_f32, header, chunk_elems=chunk_elems):
-            u32 = chunk.view(np.uint32)
-            # RNE: bf16 = (u32 + 0x7FFF + lsb_of_upper16) >> 16
-            lsb = (u32 >> 16) & 1
-            bf16_u16 = ((u32 + np.uint32(0x7FFF) + lsb) >> 16).astype(np.uint16, copy=False)
-            bf16_u16.tofile(out)
-
-
-def _compute_max_abs_f32_bin(src_f32: Path, chunk_elems: int = 1 << 20) -> float:
-    np = _require_numpy()
-    header = _read_bin_header(src_f32)
-    max_abs = 0.0
-    for chunk in _iter_f32_payload_chunks(src_f32, header, chunk_elems=chunk_elems):
-        # chunk is float32
-        local = float(np.max(np.abs(chunk)))
-        if local > max_abs:
-            max_abs = local
-    return max_abs
-
-
-def convert_f32_bin_to_int8_bin(
-    src_f32: Path,
-    dst_i8: Path,
-    scale: Optional[float] = None,
-    chunk_elems: int = 1 << 20,
-) -> float:
-    """Quantize float32 .bin to int8 .bin.
-
-    Uses symmetric linear quantization: q = round(x / scale), clamped to [-127, 127].
-    Returns the scale used.
-    """
-    np = _require_numpy()
-
-    header = _read_bin_header(src_f32)
-    dst_i8.parent.mkdir(parents=True, exist_ok=True)
-
-    if scale is None:
-        max_abs = _compute_max_abs_f32_bin(src_f32, chunk_elems=chunk_elems)
-        scale = (max_abs / 127.0) if max_abs > 0 else 1.0
-
-    with dst_i8.open("wb") as out:
-        _write_bin_header(out, header)
-        inv = 1.0 / float(scale)
-        for chunk in _iter_f32_payload_chunks(src_f32, header, chunk_elems=chunk_elems):
-            q = np.rint(chunk * inv)
-            q = np.clip(q, -127, 127).astype(np.int8)
-            q.tofile(out)
-
-    return float(scale)
 
 
 def _find_diskann_apps_dir(explicit: Optional[str]) -> Path:
@@ -140,21 +38,10 @@ def _find_diskann_apps_dir(explicit: Optional[str]) -> Path:
         if not p.exists():
             raise FileNotFoundError(f"diskann apps dir not found: {p}")
         return p
-
-    # # Heuristic: common build outputs.
-    # candidates = [
-    #     Path("/home/xtang/DiskANN-epeshared/build/apps"),
-    #     Path("/home/xtang/DiskANN/build/apps"),
-    #     Path("/home/xtang/DiskANN/build/tests"),
-    # ]
-    # for c in candidates:
-    #     if (c / "build_disk_index").exists() and (c / "search_disk_index").exists():
-    #         return c
-
-    # raise FileNotFoundError(
-    #     "Could not auto-detect DiskANN apps directory. "
-    #     "Pass --diskann-apps /path/to/DiskANN/build/apps"
-    # )
+    raise FileNotFoundError(
+        "Could not auto-detect DiskANN apps directory. "
+        "Pass --diskann-apps /path/to/DiskANN/build/apps"
+    )
 
 
 def _run(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, float, str]:
@@ -187,8 +74,6 @@ def _parse_search_table(stdout: str) -> List[Dict[str, float]]:
     rows: List[Dict[str, float]] = []
     for line in stdout.splitlines():
         toks = line.strip().split()
-        # Expected when recall is enabled:
-        # L beam QPS mean_us p999_us mean_ios mean_io_us cpu_s recall
         if len(toks) < 5:
             continue
         if not (toks[0].isdigit() and toks[1].isdigit()):
@@ -201,27 +86,12 @@ def _parse_search_table(stdout: str) -> List[Dict[str, float]]:
                 "mean_us": float(toks[3]),
                 "p999_us": float(toks[4]),
             }
-            # If recall is present, it should be the last column.
             if len(toks) >= 9:
                 row["recall"] = float(toks[-1])
             rows.append(row)
         except ValueError:
             continue
     return rows
-
-
-def _read_ids_bin(path: Path) -> Tuple[int, int, List[int]]:
-    # uint32 header (nq, k), then nq*k uint32
-    header = _read_bin_header(path)
-    nq, k = header.npts, header.dim
-    # read payload
-    np = _require_numpy()
-    with path.open("rb") as f:
-        f.seek(8)
-        arr = np.fromfile(f, dtype=np.uint32, count=nq * k)
-        if arr.size != nq * k:
-            raise IOError(f"Short read: {path}")
-    return nq, k, arr.tolist()
 
 
 def _read_ids_bin_np(path: Path):
@@ -237,12 +107,16 @@ def _read_ids_bin_np(path: Path):
 
 
 def _topk_overlap(a: List[int], b: List[int], k: int) -> float:
-    # a and b are length k
     return len(set(a[:k]).intersection(set(b[:k]))) / float(k)
 
 
 def _positional_match(a: List[int], b: List[int], k: int) -> float:
     return sum(1 for i in range(k) if a[i] == b[i]) / float(k)
+
+
+def _must_exist(p: Path, what: str) -> None:
+    if not p.exists():
+        raise FileNotFoundError(f"{what} not found: {p}")
 
 
 def main() -> int:
@@ -253,8 +127,15 @@ def main() -> int:
     ap.add_argument("--tag", default=None, help="Optional run tag")
 
     ap.add_argument("--dist", default="l2", choices=["l2", "mips", "cosine"], help="Distance function")
-    ap.add_argument("--base-f32", required=True, help="Base vectors float32 .bin")
-    ap.add_argument("--query-f32", required=True, help="Query vectors float32 .bin")
+
+    # Inputs: f32 optional now (方案B)
+    ap.add_argument("--base-f32", default=None, help="Base vectors float32 .bin")
+    ap.add_argument("--query-f32", default=None, help="Query vectors float32 .bin")
+    ap.add_argument("--base-bf16", default=None, help="Base vectors bf16 .bin (DiskANN bf16: uint16 payload)")
+    ap.add_argument("--query-bf16", default=None, help="Query vectors bf16 .bin (DiskANN bf16: uint16 payload)")
+    ap.add_argument("--base-int8", default=None, help="Base vectors int8 .bin (DiskANN int8 payload)")
+    ap.add_argument("--query-int8", default=None, help="Query vectors int8 .bin (DiskANN int8 payload)")
+
     ap.add_argument("--gt", default=None, help="Groundtruth file path (optional). If omitted, will compute per dtype")
     ap.add_argument(
         "--gt-shared",
@@ -311,11 +192,9 @@ def main() -> int:
     )
 
     args = ap.parse_args()
-
     selected_dtypes = list(dict.fromkeys(args.dtypes))
 
-    # DiskANN MIPS disk-index path does not support int8.
-    # bf16 support for MIPS depends on DiskANN build; if it is unsupported in your build, build/search may fail.
+    # mips + int8 not supported
     if args.dist == "mips" and "int8" in selected_dtypes:
         _log("Warning: skipping dtype=int8 for --dist mips (DiskANN disk index does not support int8+mips).")
         selected_dtypes = [d for d in selected_dtypes if d != "int8"]
@@ -346,6 +225,44 @@ def main() -> int:
     apps = _find_diskann_apps_dir(args.diskann_apps)
     _log(f"DiskANN apps: {apps}")
 
+    # Resolve provided inputs
+    base_f32 = Path(args.base_f32).expanduser().resolve() if args.base_f32 else None
+    query_f32 = Path(args.query_f32).expanduser().resolve() if args.query_f32 else None
+    base_bf16 = Path(args.base_bf16).expanduser().resolve() if args.base_bf16 else None
+    query_bf16 = Path(args.query_bf16).expanduser().resolve() if args.query_bf16 else None
+    base_int8 = Path(args.base_int8).expanduser().resolve() if args.base_int8 else None
+    query_int8 = Path(args.query_int8).expanduser().resolve() if args.query_int8 else None
+
+    # Validate availability by dtype
+    def _need_pair(dtype: str) -> None:
+        if dtype == "float":
+            if base_f32 is None or query_f32 is None:
+                raise ValueError("dtype=float requested but --base-f32/--query-f32 not provided")
+            _must_exist(base_f32, "base-f32")
+            _must_exist(query_f32, "query-f32")
+        elif dtype == "bf16":
+            # Either bf16 provided OR f32 provided to convert
+            if base_bf16 is not None and query_bf16 is not None:
+                _must_exist(base_bf16, "base-bf16")
+                _must_exist(query_bf16, "query-bf16")
+            elif base_f32 is not None and query_f32 is not None:
+                _must_exist(base_f32, "base-f32")
+                _must_exist(query_f32, "query-f32")
+            else:
+                raise ValueError("dtype=bf16 requested but neither (--base-bf16/--query-bf16) nor (--base-f32/--query-f32) provided")
+        elif dtype == "int8":
+            if base_int8 is not None and query_int8 is not None:
+                _must_exist(base_int8, "base-int8")
+                _must_exist(query_int8, "query-int8")
+            elif base_f32 is not None and query_f32 is not None:
+                _must_exist(base_f32, "base-f32")
+                _must_exist(query_f32, "query-f32")
+            else:
+                raise ValueError("dtype=int8 requested but neither (--base-int8/--query-int8) nor (--base-f32/--query-f32) provided")
+
+    for d in selected_dtypes:
+        _need_pair(d)
+
     run_id = time.strftime("%Y%m%d_%H%M%S")
     tag = args.tag or "pq_reorder"
     out_root = Path(args.workdir).expanduser().resolve() / f"{run_id}_{tag}"
@@ -356,73 +273,110 @@ def main() -> int:
     _log(f"Output dir: {out_root}")
     _log(f"Logs dir: {logs_dir}")
 
-    base_f32 = Path(args.base_f32).expanduser().resolve()
-    query_f32 = Path(args.query_f32).expanduser().resolve()
+    # Print input headers where available
+    if base_f32 and query_f32:
+        base_hdr = _read_bin_header(base_f32)
+        query_hdr = _read_bin_header(query_f32)
+        _log(f"Input base_f32: {base_f32} (npts={base_hdr.npts}, dim={base_hdr.dim})")
+        _log(f"Input query_f32: {query_f32} (npts={query_hdr.npts}, dim={query_hdr.dim})")
+    if base_bf16 and query_bf16:
+        base_hdr = _read_bin_header(base_bf16)
+        query_hdr = _read_bin_header(query_bf16)
+        _log(f"Input base_bf16: {base_bf16} (npts={base_hdr.npts}, dim={base_hdr.dim})")
+        _log(f"Input query_bf16: {query_bf16} (npts={query_hdr.npts}, dim={query_hdr.dim})")
+    if base_int8 and query_int8:
+        base_hdr = _read_bin_header(base_int8)
+        query_hdr = _read_bin_header(query_int8)
+        _log(f"Input base_int8: {base_int8} (npts={base_hdr.npts}, dim={base_hdr.dim})")
+        _log(f"Input query_int8: {query_int8} (npts={query_hdr.npts}, dim={query_hdr.dim})")
 
-    base_hdr = _read_bin_header(base_f32)
-    query_hdr = _read_bin_header(query_f32)
-    _log(f"Input base_f32: {base_f32} (npts={base_hdr.npts}, dim={base_hdr.dim})")
-    _log(f"Input query_f32: {query_f32} (npts={query_hdr.npts}, dim={query_hdr.dim})")
+    # Prepare per-dtype data file mapping
+    # - If user provides dtype-specific files, use them directly.
+    # - Else, derive from f32 via conversion into out_root/data/.
+    data: Dict[str, Dict[str, Path]] = {}
 
-    # Prepare per-dtype data files
-    data: Dict[str, Dict[str, Path]] = {
-        "float": {"base": base_f32, "query": query_f32},
-        "bf16": {"base": out_root / "data" / "base.bf16.bin", "query": out_root / "data" / "query.bf16.bin"},
-        "int8": {"base": out_root / "data" / "base.int8.bin", "query": out_root / "data" / "query.int8.bin"},
-    }
+    if "float" in selected_dtypes:
+        assert base_f32 is not None and query_f32 is not None
+        data["float"] = {"base": base_f32, "query": query_f32}
 
-    # Convert
+    if "bf16" in selected_dtypes:
+        if base_bf16 is not None and query_bf16 is not None:
+            data["bf16"] = {"base": base_bf16, "query": query_bf16}
+        else:
+            # convert from f32 into out_root
+            data["bf16"] = {
+                "base": out_root / "data" / "base.bf16.bin",
+                "query": out_root / "data" / "query.bf16.bin",
+            }
+
+    if "int8" in selected_dtypes:
+        if base_int8 is not None and query_int8 is not None:
+            data["int8"] = {"base": base_int8, "query": query_int8}
+        else:
+            data["int8"] = {
+                "base": out_root / "data" / "base.int8.bin",
+                "query": out_root / "data" / "query.int8.bin",
+            }
+
+    # Convert only when needed (bf16/int8 from f32)
     convert_meta: Dict[str, Dict[str, float]] = {}
 
-    if "bf16" in selected_dtypes and (
-        (not data["bf16"]["base"].exists()) or (not data["bf16"]["query"].exists())
-    ):
-        _log("Converting float32 -> bf16 for base/query")
-        convert_f32_bin_to_bf16_bin(base_f32, data["bf16"]["base"], chunk_elems=args.chunk_elems)
-        convert_f32_bin_to_bf16_bin(query_f32, data["bf16"]["query"], chunk_elems=args.chunk_elems)
-        _log(f"bf16 base: {data['bf16']['base']}")
-        _log(f"bf16 query: {data['bf16']['query']}")
-    elif "bf16" in selected_dtypes:
-        _log("bf16 base/query already exist; skipping bf16 conversion")
+    if "bf16" in selected_dtypes:
+        if (base_bf16 is None or query_bf16 is None) and (base_f32 is not None and query_f32 is not None):
+            if (not data["bf16"]["base"].exists()) or (not data["bf16"]["query"].exists()):
+                _log("Converting float32 -> bf16 for base/query")
+                convert_f32_bin_to_bf16_bin(base_f32, data["bf16"]["base"], chunk_elems=args.chunk_elems)
+                convert_f32_bin_to_bf16_bin(query_f32, data["bf16"]["query"], chunk_elems=args.chunk_elems)
+                _log(f"bf16 base: {data['bf16']['base']}")
+                _log(f"bf16 query: {data['bf16']['query']}")
+            else:
+                _log("bf16 base/query already exist; skipping bf16 conversion")
+        else:
+            _log("bf16 inputs provided; skipping bf16 conversion")
 
     int8_scale = args.int8_scale
-    if "int8" in selected_dtypes and (
-        (not data["int8"]["base"].exists()) or (not data["int8"]["query"].exists())
-    ):
-        _log("Converting float32 -> int8 for base/query")
-        if int8_scale is None:
-            # Choose a single scale based on base+query maxabs, so queries/base are consistent.
-            base_max = _compute_max_abs_f32_bin(base_f32, chunk_elems=args.chunk_elems)
-            query_max = _compute_max_abs_f32_bin(query_f32, chunk_elems=args.chunk_elems)
-            max_abs = max(base_max, query_max)
-            int8_scale = (max_abs / 127.0) if max_abs > 0 else 1.0
-            _log(f"Auto int8 scale: max_abs={max_abs:.6g} => scale={float(int8_scale):.6g}")
-        else:
-            _log(f"User int8 scale: scale={float(int8_scale):.6g}")
+    if "int8" in selected_dtypes:
+        if (base_int8 is None or query_int8 is None) and (base_f32 is not None and query_f32 is not None):
+            if (not data["int8"]["base"].exists()) or (not data["int8"]["query"].exists()):
+                _log("Converting float32 -> int8 for base/query")
+                if int8_scale is None:
+                    base_max = _compute_max_abs_f32_bin(base_f32, chunk_elems=args.chunk_elems)
+                    query_max = _compute_max_abs_f32_bin(query_f32, chunk_elems=args.chunk_elems)
+                    max_abs = max(base_max, query_max)
+                    int8_scale = (max_abs / 127.0) if max_abs > 0 else 1.0
+                    _log(f"Auto int8 scale: max_abs={max_abs:.6g} => scale={float(int8_scale):.6g}")
+                else:
+                    _log(f"User int8 scale: scale={float(int8_scale):.6g}")
 
-        used_scale_base = convert_f32_bin_to_int8_bin(
-            base_f32, data["int8"]["base"], scale=float(int8_scale), chunk_elems=args.chunk_elems
-        )
-        used_scale_query = convert_f32_bin_to_int8_bin(
-            query_f32, data["int8"]["query"], scale=float(int8_scale), chunk_elems=args.chunk_elems
-        )
-        convert_meta["int8"] = {"scale": float(int8_scale), "used_scale_base": used_scale_base, "used_scale_query": used_scale_query}
-        _log(f"int8 base: {data['int8']['base']}")
-        _log(f"int8 query: {data['int8']['query']}")
-    elif "int8" in selected_dtypes:
-        _log("int8 base/query already exist; skipping int8 conversion")
+                used_scale_base = convert_f32_bin_to_int8_bin(
+                    base_f32, data["int8"]["base"], scale=float(int8_scale), chunk_elems=args.chunk_elems
+                )
+                used_scale_query = convert_f32_bin_to_int8_bin(
+                    query_f32, data["int8"]["query"], scale=float(int8_scale), chunk_elems=args.chunk_elems
+                )
+                convert_meta["int8"] = {
+                    "scale": float(int8_scale),
+                    "used_scale_base": used_scale_base,
+                    "used_scale_query": used_scale_query,
+                }
+                _log(f"int8 base: {data['int8']['base']}")
+                _log(f"int8 query: {data['int8']['query']}")
+            else:
+                _log("int8 base/query already exist; skipping int8 conversion")
+        else:
+            _log("int8 inputs provided; skipping int8 conversion")
 
     # GT
     gt_paths: Dict[str, Optional[Path]] = {"float": None, "bf16": None, "int8": None}
     if args.gt:
         _log(f"Using provided groundtruth path for all dtypes: {args.gt}")
-        gt_paths = {
-            "float": Path(args.gt).expanduser().resolve(),
-            "bf16": Path(args.gt).expanduser().resolve(),
-            "int8": Path(args.gt).expanduser().resolve(),
-        }
+        p = Path(args.gt).expanduser().resolve()
+        _must_exist(p, "gt")
+        gt_paths = {"float": p, "bf16": p, "int8": p}
     elif not args.skip_gt:
         if args.gt_shared == "float":
+            if "float" not in selected_dtypes:
+                raise ValueError("--gt-shared=float requires dtype=float to be selected (or provide --gt)")
             _log("Computing groundtruth for float and reusing it for other dtypes (--gt-shared=float)")
             gt_out = out_root / "gt" / f"gt_float_K{args.K}.bin"
             gt_out.parent.mkdir(parents=True, exist_ok=True)
@@ -483,6 +437,7 @@ def main() -> int:
     for dtype in selected_dtypes:
         dtype_dir = out_root / dtype
         dtype_dir.mkdir(exist_ok=True)
+
         index_prefix = dtype_dir / "index" / f"disk_index_{dtype}_R{args.R}_L{args.Lbuild}_PQ{args.PQ_disk_bytes}"
         index_prefix.parent.mkdir(parents=True, exist_ok=True)
 
@@ -492,7 +447,6 @@ def main() -> int:
         _log(f"=== dtype={dtype} (reorder={'on' if want_reorder else 'off'}) ===")
 
         # Build
-        build_log = ""
         build_time_s = None
         if not args.skip_build:
             cmd = [
@@ -525,7 +479,6 @@ def main() -> int:
 
             _log("Build cmd: " + " ".join(cmd))
             rc, elapsed, out = _run(cmd)
-            build_log = out
             build_time_s = elapsed
             (logs_dir / f"build_{dtype}.log").write_text(out)
             _log(f"Build {dtype}: rc={rc}, time_s={elapsed:.3f}, log={logs_dir / f'build_{dtype}.log'}")
@@ -536,7 +489,6 @@ def main() -> int:
 
         # Search
         search_rows: List[Dict[str, float]] = []
-        search_log = ""
         search_time_s = None
         result_prefix = dtype_dir / "results" / "res"
         result_prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -572,7 +524,6 @@ def main() -> int:
 
             _log("Search cmd: " + " ".join(cmd))
             rc, elapsed, out = _run(cmd)
-            search_log = out
             search_time_s = elapsed
             (logs_dir / f"search_{dtype}.log").write_text(out)
             _log(f"Search {dtype}: rc={rc}, time_s={elapsed:.3f}, log={logs_dir / f'search_{dtype}.log'}")
@@ -649,7 +600,6 @@ def main() -> int:
     else:
         _log("Skipping consistency (need float + at least one of bf16/int8)")
 
-    # Persist raw summary (consistency computed in a later step)
     summary = {
         "meta": {
             "run_id": run_id,
