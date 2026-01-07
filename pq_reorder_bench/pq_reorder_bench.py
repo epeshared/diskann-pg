@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+import struct
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -18,13 +19,7 @@ _REPO_ROOT = _THIS_DIR.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from bench_data.bin_utils import (  # noqa: E402
-    BinHeader,
-    convert_f32_bin_to_bf16_bin,
-    convert_f32_bin_to_int8_bin,
-    read_bin_header as _read_bin_header,
-    require_numpy as _require_numpy,
-)
+from bench_data.bin_utils import read_bin_header as _read_bin_header, require_numpy as _require_numpy  # noqa: E402
 
 
 def _log(msg: str) -> None:
@@ -119,70 +114,137 @@ def _must_exist(p: Path, what: str) -> None:
         raise FileNotFoundError(f"{what} not found: {p}")
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Benchmark PQ+reorder for float/bf16/int8 with consistency checks")
-    ap.add_argument("--diskann-apps", default=None, help="Path to DiskANN build apps dir (contains build_disk_index)")
+def _expected_elem_bytes(data_type: str) -> int:
+    dt = data_type.lower()
+    if dt in ("float", "f32"):
+        return 4
+    if dt in ("bf16", "bfloat16"):
+        return 2
+    if dt in ("int8", "i8", "uint8", "u8"):
+        return 1
+    raise ValueError(f"Unsupported dtype: {data_type}")
 
-    ap.add_argument("--workdir", default=str(Path(__file__).resolve().parent / "out"), help="Output work dir")
+
+def _infer_elem_bytes_from_bin(path: Path) -> Tuple[int, int, int]:
+    """Return (npts, dim, elem_bytes) inferred from file size.
+
+    DiskANN .bin layout: uint32 npts, uint32 dim, then contiguous payload.
+    """
+    file_size = path.stat().st_size
+    if file_size < 8:
+        raise ValueError(f"File too small to be a DiskANN .bin: {path} (size={file_size})")
+
+    with path.open("rb") as f:
+        header = f.read(8)
+    npts, dim = struct.unpack("<II", header)
+    payload = file_size - 8
+    if npts == 0 or dim == 0:
+        raise ValueError(f"Invalid .bin header in {path}: npts={npts}, dim={dim}")
+
+    total_elems = int(npts) * int(dim)
+    if total_elems <= 0:
+        raise ValueError(f"Invalid element count inferred from header in {path}: npts={npts}, dim={dim}")
+
+    if payload % total_elems != 0:
+        raise ValueError(
+            f"File size does not match header: {path} payload_bytes={payload} is not divisible by npts*dim={total_elems}"
+        )
+    elem_bytes = payload // total_elems
+    return int(npts), int(dim), int(elem_bytes)
+
+
+def _disk_index_has_reorder_data(index_prefix: Path) -> bool:
+    """Returns True if <prefix>_disk.index metadata indicates reorder data exists."""
+    index_path = Path(str(index_prefix) + "_disk.index")
+    if not index_path.exists():
+        return False
+
+    with index_path.open("rb") as f:
+        header = f.read(8)
+        if len(header) != 8:
+            return False
+        nr, nc = struct.unpack("<II", header)
+        if nr < 8 or nc != 1:
+            return False
+        meta = f.read(int(nr) * 8)
+        if len(meta) != int(nr) * 8:
+            return False
+        vals = struct.unpack("<" + "Q" * int(nr), meta)
+
+    reorder_exists = vals[7]
+    return bool(reorder_exists)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=(
+            "Search-only benchmark for DiskANN disk index. "
+            "Reads prebuilt indexes from --run-root and runs search_disk_index for selected dtypes."
+        )
+    )
+    ap.add_argument(
+        "--diskann-apps",
+        required=True,
+        help="Path to DiskANN build apps dir (contains search_disk_index).",
+    )
+    ap.add_argument(
+        "--index-root",
+        default=None,
+        help=(
+            "Directory containing prebuilt indexes. Expected layout: "
+            "<index-root>/<dtype>/index/*_disk.index"
+        ),
+    )
+
+    # Legacy name: --run-root (kept for compatibility)
+    ap.add_argument(
+        "--run-root",
+        dest="index_root",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+
+    ap.add_argument(
+        "--query-file",
+        required=True,
+        help=(
+            "Query .bin file path. "
+            "If you pass multiple dtypes, you can use a template containing '{dtype}', "
+            "e.g. /path/to/query_{dtype}.bin or /path/to/query.<dtype>.bin"
+        ),
+    )
+
+    ap.add_argument(
+        "--workdir",
+        default=None,
+        help="Output work dir for logs/results/summary. Default: <run-root>/search_out",
+    )
     ap.add_argument("--tag", default=None, help="Optional run tag")
 
     ap.add_argument("--dist", default="l2", choices=["l2", "mips", "cosine"], help="Distance function")
-
-    # Inputs: f32 optional now (方案B)
-    ap.add_argument("--base-f32", default=None, help="Base vectors float32 .bin")
-    ap.add_argument("--query-f32", default=None, help="Query vectors float32 .bin")
-    ap.add_argument("--base-bf16", default=None, help="Base vectors bf16 .bin (DiskANN bf16: uint16 payload)")
-    ap.add_argument("--query-bf16", default=None, help="Query vectors bf16 .bin (DiskANN bf16: uint16 payload)")
-    ap.add_argument("--base-int8", default=None, help="Base vectors int8 .bin (DiskANN int8 payload)")
-    ap.add_argument("--query-int8", default=None, help="Query vectors int8 .bin (DiskANN int8 payload)")
-
-    ap.add_argument("--gt", default=None, help="Groundtruth file path (optional). If omitted, will compute per dtype")
-    ap.add_argument(
-        "--gt-shared",
-        default="none",
-        choices=["none", "float"],
-        help=(
-            "Which GT file to use when computing Recall@K for non-float dtypes. "
-            "'none' computes/uses per-dtype GT (default). "
-            "'float' evaluates bf16/int8 recall against the float32 GT file."
-        ),
-    )
-
-    ap.add_argument("--R", type=int, default=64)
-    ap.add_argument("--Lbuild", type=int, default=100)
-    ap.add_argument("--B", type=float, default=0.25, help="search_DRAM_budget GB")
-    ap.add_argument("--M", type=float, default=4.0, help="build_DRAM_budget GB")
-    ap.add_argument("--PQ-disk-bytes", type=int, default=32, help="PQ bytes on SSD; must be >0 for reorder")
-    ap.add_argument(
-        "--QD",
-        type=int,
-        default=0,
-        help=(
-            "Override DiskANN 'quantized dimension' used for in-memory compression during build/search. "
-            "If 0, DiskANN derives it from -B/--search_DRAM_budget, which can become very large for small datasets."
-        ),
-    )
     ap.add_argument("--threads", type=int, default=os.cpu_count() or 8)
 
     ap.add_argument("--K", type=int, default=10)
-    ap.add_argument("--Ls", type=int, nargs="+", default=[10, 20, 30, 40, 50, 100])
+    ap.add_argument("--Ls", type=int, nargs="+", default=[100])
     ap.add_argument("--beamwidth", type=int, default=2)
     ap.add_argument("--num-nodes-to-cache", type=int, default=0)
-
-    ap.add_argument("--skip-build", action="store_true")
-    ap.add_argument("--skip-gt", action="store_true")
-    ap.add_argument("--skip-search", action="store_true")
 
     ap.add_argument(
         "--dtypes",
         nargs="+",
-        default=["float", "bf16", "int8"],
+        default=["bf16"],
         choices=["float", "bf16", "int8"],
-        help="Which dtypes to run. Default: float bf16 int8. Use e.g. --dtypes bf16 for quick-check.",
+        help="Which dtypes to search. Default: bf16",
     )
 
-    ap.add_argument("--int8-scale", type=float, default=None, help="Quantization scale for int8 (optional)")
-    ap.add_argument("--chunk-elems", type=int, default=1 << 20, help="Conversion chunk size in elements")
+    ap.add_argument(
+        "--gt-file",
+        default=None,
+        help=(
+            "Optional groundtruth file to pass to search_disk_index (--gt_file). "
+            "If omitted, will auto-use <run-root>/gt/gt_float_K{K}.bin if present."
+        ),
+    )
 
     ap.add_argument(
         "--consistency-L",
@@ -199,352 +261,150 @@ def main() -> int:
         _log("Warning: skipping dtype=int8 for --dist mips (DiskANN disk index does not support int8+mips).")
         selected_dtypes = [d for d in selected_dtypes if d != "int8"]
 
-    _log("Starting pq_reorder_bench (SSD/disk index only)")
-    _log(
-        "Args: "
-        + " ".join(
-            [
-                f"dist={args.dist}",
-                f"K={args.K}",
-                f"Ls={args.Ls}",
-                f"dtypes={selected_dtypes}",
-                f"R={args.R}",
-                f"Lbuild={args.Lbuild}",
-                f"PQ_disk_bytes={args.PQ_disk_bytes}",
-                f"QD={args.QD}",
-                f"threads={args.threads}",
-                f"B={args.B}",
-                f"M={args.M}",
-                f"skip_build={args.skip_build}",
-                f"skip_search={args.skip_search}",
-                f"skip_gt={args.skip_gt}",
-            ]
-        )
-    )
+    if not args.index_root:
+        raise ValueError("--index-root is required")
 
     apps = _find_diskann_apps_dir(args.diskann_apps)
-    _log(f"DiskANN apps: {apps}")
+    index_root = Path(args.index_root).expanduser().resolve()
+    _must_exist(index_root, "index_root")
 
-    # Resolve provided inputs
-    base_f32 = Path(args.base_f32).expanduser().resolve() if args.base_f32 else None
-    query_f32 = Path(args.query_f32).expanduser().resolve() if args.query_f32 else None
-    base_bf16 = Path(args.base_bf16).expanduser().resolve() if args.base_bf16 else None
-    query_bf16 = Path(args.query_bf16).expanduser().resolve() if args.query_bf16 else None
-    base_int8 = Path(args.base_int8).expanduser().resolve() if args.base_int8 else None
-    query_int8 = Path(args.query_int8).expanduser().resolve() if args.query_int8 else None
+    query_file_arg = str(args.query_file)
+    if "{dtype}" not in query_file_arg and len(selected_dtypes) != 1:
+        raise ValueError("When --query-file does not contain '{dtype}', you must specify exactly one dtype via --dtypes")
 
-    # Validate availability by dtype
-    def _need_pair(dtype: str) -> None:
-        if dtype == "float":
-            if base_f32 is None or query_f32 is None:
-                raise ValueError("dtype=float requested but --base-f32/--query-f32 not provided")
-            _must_exist(base_f32, "base-f32")
-            _must_exist(query_f32, "query-f32")
-        elif dtype == "bf16":
-            # Either bf16 provided OR f32 provided to convert
-            if base_bf16 is not None and query_bf16 is not None:
-                _must_exist(base_bf16, "base-bf16")
-                _must_exist(query_bf16, "query-bf16")
-            elif base_f32 is not None and query_f32 is not None:
-                _must_exist(base_f32, "base-f32")
-                _must_exist(query_f32, "query-f32")
-            else:
-                raise ValueError("dtype=bf16 requested but neither (--base-bf16/--query-bf16) nor (--base-f32/--query-f32) provided")
-        elif dtype == "int8":
-            if base_int8 is not None and query_int8 is not None:
-                _must_exist(base_int8, "base-int8")
-                _must_exist(query_int8, "query-int8")
-            elif base_f32 is not None and query_f32 is not None:
-                _must_exist(base_f32, "base-f32")
-                _must_exist(query_f32, "query-f32")
-            else:
-                raise ValueError("dtype=int8 requested but neither (--base-int8/--query-int8) nor (--base-f32/--query-f32) provided")
+    def _find_latest_index_prefix(dtype: str) -> Path:
+        # Support multiple layouts:
+        # 1) <index-root>/<dtype>/index/*_disk.index
+        # 2) <index-root>/<dtype>/*_disk.index
+        # 3) <index-root>/*_disk.index
+        search_dirs = [
+            index_root / dtype / "index",
+            index_root / dtype,
+            index_root,
+        ]
+        candidates: List[Path] = []
+        for d in search_dirs:
+            if d.exists() and d.is_dir():
+                candidates.extend(d.glob("*_disk.index"))
 
-    for d in selected_dtypes:
-        _need_pair(d)
+        if not candidates:
+            tried = ", ".join(str(d) for d in search_dirs)
+            raise FileNotFoundError(
+                f"No *_disk.index found for dtype={dtype} under any of: {tried}. "
+                "Hint: point --index-root to the directory that contains the *_disk.index (or <dtype>/index/*_disk.index)."
+            )
+
+        candidates = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+        disk_index = candidates[0]
+        prefix = Path(str(disk_index)[: -len("_disk.index")])
+        return prefix
+
+    def _resolve_query_file(dtype: str) -> Path:
+        s = query_file_arg.replace("{dtype}", dtype)
+        p = Path(s).expanduser().resolve()
+        _must_exist(p, f"query_file for dtype={dtype}")
+        return p
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
-    tag = args.tag or "pq_reorder"
-    out_root = Path(args.workdir).expanduser().resolve() / f"{run_id}_{tag}"
+    tag = args.tag or "pq_search"
+    script_dir = Path(__file__).resolve().parent
+    base_workdir = Path(args.workdir).expanduser().resolve() if args.workdir else (script_dir / "runs")
+    out_root = base_workdir / f"{run_id}_{tag}"
     out_root.mkdir(parents=True, exist_ok=True)
     logs_dir = out_root / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
+    _log(f"Index root: {index_root}")
+    _log(f"Query file: {args.query_file}")
     _log(f"Output dir: {out_root}")
-    _log(f"Logs dir: {logs_dir}")
+    _log(f"DiskANN apps: {apps}")
 
-    # Print input headers where available
-    if base_f32 and query_f32:
-        base_hdr = _read_bin_header(base_f32)
-        query_hdr = _read_bin_header(query_f32)
-        _log(f"Input base_f32: {base_f32} (npts={base_hdr.npts}, dim={base_hdr.dim})")
-        _log(f"Input query_f32: {query_f32} (npts={query_hdr.npts}, dim={query_hdr.dim})")
-    if base_bf16 and query_bf16:
-        base_hdr = _read_bin_header(base_bf16)
-        query_hdr = _read_bin_header(query_bf16)
-        _log(f"Input base_bf16: {base_bf16} (npts={base_hdr.npts}, dim={base_hdr.dim})")
-        _log(f"Input query_bf16: {query_bf16} (npts={query_hdr.npts}, dim={query_hdr.dim})")
-    if base_int8 and query_int8:
-        base_hdr = _read_bin_header(base_int8)
-        query_hdr = _read_bin_header(query_int8)
-        _log(f"Input base_int8: {base_int8} (npts={base_hdr.npts}, dim={base_hdr.dim})")
-        _log(f"Input query_int8: {query_int8} (npts={query_hdr.npts}, dim={query_hdr.dim})")
-
-    # Prepare per-dtype data file mapping
-    # - If user provides dtype-specific files, use them directly.
-    # - Else, derive from f32 via conversion into out_root/data/.
-    data: Dict[str, Dict[str, Path]] = {}
-
-    if "float" in selected_dtypes:
-        assert base_f32 is not None and query_f32 is not None
-        data["float"] = {"base": base_f32, "query": query_f32}
-
-    if "bf16" in selected_dtypes:
-        if base_bf16 is not None and query_bf16 is not None:
-            data["bf16"] = {"base": base_bf16, "query": query_bf16}
-        else:
-            # convert from f32 into out_root
-            data["bf16"] = {
-                "base": out_root / "data" / "base.bf16.bin",
-                "query": out_root / "data" / "query.bf16.bin",
-            }
-
-    if "int8" in selected_dtypes:
-        if base_int8 is not None and query_int8 is not None:
-            data["int8"] = {"base": base_int8, "query": query_int8}
-        else:
-            data["int8"] = {
-                "base": out_root / "data" / "base.int8.bin",
-                "query": out_root / "data" / "query.int8.bin",
-            }
-
-    # Convert only when needed (bf16/int8 from f32)
-    convert_meta: Dict[str, Dict[str, float]] = {}
-
-    if "bf16" in selected_dtypes:
-        if (base_bf16 is None or query_bf16 is None) and (base_f32 is not None and query_f32 is not None):
-            if (not data["bf16"]["base"].exists()) or (not data["bf16"]["query"].exists()):
-                _log("Converting float32 -> bf16 for base/query")
-                convert_f32_bin_to_bf16_bin(base_f32, data["bf16"]["base"], chunk_elems=args.chunk_elems)
-                convert_f32_bin_to_bf16_bin(query_f32, data["bf16"]["query"], chunk_elems=args.chunk_elems)
-                _log(f"bf16 base: {data['bf16']['base']}")
-                _log(f"bf16 query: {data['bf16']['query']}")
-            else:
-                _log("bf16 base/query already exist; skipping bf16 conversion")
-        else:
-            _log("bf16 inputs provided; skipping bf16 conversion")
-
-    int8_scale = args.int8_scale
-    if "int8" in selected_dtypes:
-        if (base_int8 is None or query_int8 is None) and (base_f32 is not None and query_f32 is not None):
-            if (not data["int8"]["base"].exists()) or (not data["int8"]["query"].exists()):
-                _log("Converting float32 -> int8 for base/query")
-                if int8_scale is None:
-                    base_max = _compute_max_abs_f32_bin(base_f32, chunk_elems=args.chunk_elems)
-                    query_max = _compute_max_abs_f32_bin(query_f32, chunk_elems=args.chunk_elems)
-                    max_abs = max(base_max, query_max)
-                    int8_scale = (max_abs / 127.0) if max_abs > 0 else 1.0
-                    _log(f"Auto int8 scale: max_abs={max_abs:.6g} => scale={float(int8_scale):.6g}")
-                else:
-                    _log(f"User int8 scale: scale={float(int8_scale):.6g}")
-
-                used_scale_base = convert_f32_bin_to_int8_bin(
-                    base_f32, data["int8"]["base"], scale=float(int8_scale), chunk_elems=args.chunk_elems
-                )
-                used_scale_query = convert_f32_bin_to_int8_bin(
-                    query_f32, data["int8"]["query"], scale=float(int8_scale), chunk_elems=args.chunk_elems
-                )
-                convert_meta["int8"] = {
-                    "scale": float(int8_scale),
-                    "used_scale_base": used_scale_base,
-                    "used_scale_query": used_scale_query,
-                }
-                _log(f"int8 base: {data['int8']['base']}")
-                _log(f"int8 query: {data['int8']['query']}")
-            else:
-                _log("int8 base/query already exist; skipping int8 conversion")
-        else:
-            _log("int8 inputs provided; skipping int8 conversion")
-
-    # GT
-    gt_paths: Dict[str, Optional[Path]] = {"float": None, "bf16": None, "int8": None}
-    if args.gt:
-        _log(f"Using provided groundtruth path for all dtypes: {args.gt}")
-        p = Path(args.gt).expanduser().resolve()
-        _must_exist(p, "gt")
-        gt_paths = {"float": p, "bf16": p, "int8": p}
-    elif not args.skip_gt:
-        if args.gt_shared == "float":
-            if "float" not in selected_dtypes:
-                raise ValueError("--gt-shared=float requires dtype=float to be selected (or provide --gt)")
-            _log("Computing groundtruth for float and reusing it for other dtypes (--gt-shared=float)")
-            gt_out = out_root / "gt" / f"gt_float_K{args.K}.bin"
-            gt_out.parent.mkdir(parents=True, exist_ok=True)
-            cmd = [
-                str(apps / "utils" / "compute_groundtruth"),
-                "--data_type",
-                "float",
-                "--dist_fn",
-                args.dist,
-                "--base_file",
-                str(data["float"]["base"]),
-                "--query_file",
-                str(data["float"]["query"]),
-                "--gt_file",
-                str(gt_out),
-                "--K",
-                str(args.K),
-            ]
-            rc, elapsed, out = _run(cmd)
-            (logs_dir / "compute_gt_float.log").write_text(out)
-            _log(f"GT float: rc={rc}, time_s={elapsed:.3f}, log={logs_dir / 'compute_gt_float.log'}")
-            if rc != 0:
-                raise RuntimeError(f"compute_groundtruth failed for float (rc={rc}). See logs.")
-            for dtype in gt_paths.keys():
-                gt_paths[dtype] = gt_out
-        else:
-            _log("Computing groundtruth per dtype")
-            for dtype in selected_dtypes:
-                gt_out = out_root / "gt" / f"gt_{dtype}_K{args.K}.bin"
-                gt_out.parent.mkdir(parents=True, exist_ok=True)
-                cmd = [
-                    str(apps / "utils" / "compute_groundtruth"),
-                    "--data_type",
-                    dtype,
-                    "--dist_fn",
-                    args.dist,
-                    "--base_file",
-                    str(data[dtype]["base"]),
-                    "--query_file",
-                    str(data[dtype]["query"]),
-                    "--gt_file",
-                    str(gt_out),
-                    "--K",
-                    str(args.K),
-                ]
-                rc, elapsed, out = _run(cmd)
-                (logs_dir / f"compute_gt_{dtype}.log").write_text(out)
-                _log(f"GT {dtype}: rc={rc}, time_s={elapsed:.3f}, log={logs_dir / f'compute_gt_{dtype}.log'}")
-                if rc != 0:
-                    raise RuntimeError(f"compute_groundtruth failed for {dtype} (rc={rc}). See logs.")
-                gt_paths[dtype] = gt_out
+    gt_file: Optional[Path] = None
+    if args.gt_file:
+        gt_file = Path(args.gt_file).expanduser().resolve()
+        _must_exist(gt_file, "gt_file")
     else:
-        _log("Skipping groundtruth computation (--skip-gt)")
+        auto_gt = index_root / "gt" / f"gt_float_K{args.K}.bin"
+        if auto_gt.exists():
+            gt_file = auto_gt
 
-    # Build + search
+    # Search
     results: Dict[str, Dict[str, object]] = {}
-
     for dtype in selected_dtypes:
+        index_prefix = _find_latest_index_prefix(dtype)
+        query_file = _resolve_query_file(dtype)
+
+        # Validate query file dtype by inferring element-size.
+        try:
+            npts, dim, inferred_elem_bytes = _infer_elem_bytes_from_bin(query_file)
+            expected_bytes = _expected_elem_bytes(dtype)
+            if inferred_elem_bytes != expected_bytes:
+                raise ValueError(
+                    "Query file dtype mismatch:\n"
+                    f"  dtype: {dtype} (expected elem_bytes={expected_bytes})\n"
+                    f"  query_file: {query_file}\n"
+                    f"  header: npts={npts} dim={dim}\n"
+                    f"  inferred elem_bytes from file size: {inferred_elem_bytes}"
+                )
+        except Exception as e:
+            raise RuntimeError(f"Failed validating query file '{query_file}' for dtype={dtype}: {e}")
+
         dtype_dir = out_root / dtype
-        dtype_dir.mkdir(exist_ok=True)
-
-        index_prefix = dtype_dir / "index" / f"disk_index_{dtype}_R{args.R}_L{args.Lbuild}_PQ{args.PQ_disk_bytes}"
-        index_prefix.parent.mkdir(parents=True, exist_ok=True)
-
-        can_reorder = dtype in ("float", "bf16")
-        want_reorder = can_reorder
-
-        _log(f"=== dtype={dtype} (reorder={'on' if want_reorder else 'off'}) ===")
-
-        # Build
-        build_time_s = None
-        if not args.skip_build:
-            cmd = [
-                str(apps / "build_disk_index"),
-                "--data_type",
-                dtype,
-                "--dist_fn",
-                args.dist,
-                "--data_path",
-                str(data[dtype]["base"]),
-                "--index_path_prefix",
-                str(index_prefix),
-                "-R",
-                str(args.R),
-                "-L",
-                str(args.Lbuild),
-                "-B",
-                str(args.B),
-                "-M",
-                str(args.M),
-                "--PQ_disk_bytes",
-                str(args.PQ_disk_bytes),
-                "-T",
-                str(args.threads),
-            ]
-            if args.QD and int(args.QD) > 0:
-                cmd.extend(["--QD", str(int(args.QD))])
-            if want_reorder:
-                cmd.append("--append_reorder_data")
-
-            _log("Build cmd: " + " ".join(cmd))
-            rc, elapsed, out = _run(cmd)
-            build_time_s = elapsed
-            (logs_dir / f"build_{dtype}.log").write_text(out)
-            _log(f"Build {dtype}: rc={rc}, time_s={elapsed:.3f}, log={logs_dir / f'build_{dtype}.log'}")
-            if rc != 0:
-                raise RuntimeError(f"build_disk_index failed for {dtype} (rc={rc}). See logs.")
-        else:
-            _log("Skipping build (--skip-build)")
-
-        # Search
-        search_rows: List[Dict[str, float]] = []
-        search_time_s = None
+        dtype_dir.mkdir(parents=True, exist_ok=True)
         result_prefix = dtype_dir / "results" / "res"
         result_prefix.parent.mkdir(parents=True, exist_ok=True)
 
-        if not args.skip_search:
-            cmd = [
-                str(apps / "search_disk_index"),
-                "--data_type",
-                dtype,
-                "--dist_fn",
-                args.dist,
-                "--index_path_prefix",
-                str(index_prefix),
-                "--query_file",
-                str(data[dtype]["query"]),
-                "--result_path",
-                str(result_prefix),
-                "-K",
-                str(args.K),
-                "-L",
-                *[str(x) for x in args.Ls],
-                "-W",
-                str(args.beamwidth),
-                "--num_nodes_to_cache",
-                str(args.num_nodes_to_cache),
-                "-T",
-                str(args.threads),
-            ]
-            if gt_paths[dtype] is not None:
-                cmd.extend(["--gt_file", str(gt_paths[dtype])])
-            if want_reorder:
-                cmd.append("--use_reorder_data")
+        want_reorder = dtype in ("float", "bf16") and _disk_index_has_reorder_data(index_prefix)
+        if dtype in ("float", "bf16") and not want_reorder:
+            _log(f"Note: index has no reorder data; running PQ-only (dtype={dtype}).")
+        cmd = [
+            str(apps / "search_disk_index"),
+            "--data_type",
+            dtype,
+            "--dist_fn",
+            args.dist,
+            "--index_path_prefix",
+            str(index_prefix),
+            "--query_file",
+            str(query_file),
+            "--result_path",
+            str(result_prefix),
+            "-K",
+            str(args.K),
+            "-L",
+            *[str(x) for x in args.Ls],
+            "-W",
+            str(args.beamwidth),
+            "--num_nodes_to_cache",
+            str(args.num_nodes_to_cache),
+            "-T",
+            str(args.threads),
+        ]
+        if gt_file is not None:
+            cmd.extend(["--gt_file", str(gt_file)])
+        if want_reorder:
+            cmd.append("--use_reorder_data")
 
-            _log("Search cmd: " + " ".join(cmd))
-            rc, elapsed, out = _run(cmd)
-            search_time_s = elapsed
-            (logs_dir / f"search_{dtype}.log").write_text(out)
-            _log(f"Search {dtype}: rc={rc}, time_s={elapsed:.3f}, log={logs_dir / f'search_{dtype}.log'}")
-            if rc != 0:
-                raise RuntimeError(f"search_disk_index failed for {dtype} (rc={rc}). See logs.")
-            search_rows = _parse_search_table(out)
-            if search_rows:
-                _log(f"Parsed {len(search_rows)} search row(s) for {dtype}: Ls={[int(r['L']) for r in search_rows]}")
-            else:
-                _log(f"Warning: failed to parse any search table rows for {dtype}; see log")
+        _log(f"=== dtype={dtype} (reorder={'on' if want_reorder else 'off'}) ===")
+        _log("Search cmd: " + " ".join(cmd))
+        rc, elapsed, out = _run(cmd)
+        (logs_dir / f"search_{dtype}.log").write_text(out)
+        _log(f"Search {dtype}: rc={rc}, time_s={elapsed:.3f}, log={logs_dir / f'search_{dtype}.log'}")
+        if rc != 0:
+            raise RuntimeError(f"search_disk_index failed for {dtype} (rc={rc}). See logs.")
+
+        search_rows = _parse_search_table(out)
+        if search_rows:
+            _log(f"Parsed {len(search_rows)} search row(s) for {dtype}: Ls={[int(r['L']) for r in search_rows]}")
         else:
-            _log("Skipping search (--skip-search)")
+            _log(f"Warning: failed to parse any search table rows for {dtype}; see log")
 
         results[dtype] = {
             "dtype": dtype,
-            "base": str(data[dtype]["base"]),
-            "query": str(data[dtype]["query"]),
+            "query": str(query_file),
             "index_prefix": str(index_prefix),
             "reorder": bool(want_reorder),
-            "build_time_s": build_time_s,
-            "search_time_s": search_time_s,
+            "search_time_s": float(elapsed),
             "search_rows": search_rows,
         }
 
@@ -605,19 +465,16 @@ def main() -> int:
             "run_id": run_id,
             "tag": tag,
             "diskann_apps": str(apps),
+            "index_root": str(index_root),
+            "query_file": str(args.query_file),
             "dist": args.dist,
             "K": args.K,
             "Ls": args.Ls,
-            "R": args.R,
-            "Lbuild": args.Lbuild,
-            "B": args.B,
-            "M": args.M,
-            "PQ_disk_bytes": args.PQ_disk_bytes,
-            "QD": args.QD,
+            "beamwidth": args.beamwidth,
+            "num_nodes_to_cache": args.num_nodes_to_cache,
             "threads": args.threads,
+            "gt_file": str(gt_file) if gt_file else None,
         },
-        "convert": convert_meta,
-        "gt": {k: (str(v) if v else None) for k, v in gt_paths.items()},
         "results": results,
         "consistency": consistency,
     }

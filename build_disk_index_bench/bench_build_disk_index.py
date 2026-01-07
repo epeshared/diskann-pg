@@ -154,6 +154,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--qd", type=int, default=None, help="--QD")
     parser.add_argument("--use-opq", action="store_true", help="--use_opq")
     parser.add_argument("--append-reorder-data", action="store_true", help="--append_reorder_data")
+    parser.add_argument(
+        "--with-reorder",
+        dest="append_reorder_data",
+        action="store_true",
+        help="Alias for --append-reorder-data (build disk index with reorder data)",
+    )
     parser.add_argument("--codebook-prefix", default=None, help="--codebook_prefix")
 
     parser.add_argument(
@@ -208,6 +214,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_root = out_root
     run_root.mkdir(parents=True, exist_ok=True)
 
+    if args.append_reorder_data:
+        if args.pq_disk_bytes is None or int(args.pq_disk_bytes) == 0:
+            print(
+                "ERROR: --append-reorder-data/--with-reorder requires disk PQ on SSD.\n"
+                "Fix: pass --pq-disk-bytes <N> (N > 0), e.g. --pq-disk-bytes 64 (choose what you need).\n"
+            )
+            return 2
+
     # Build the shared CLI args for build_disk_index.
     def build_common_cli(index_prefix: Path) -> List[str]:
         cli: List[str] = [
@@ -261,7 +275,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     results: List[RunResult] = []
     for isa, exe in ("avx512", avx_exe), ("amx", amx_exe):
         for run_idx in range(args.runs):
-            prefix = run_root / isa / f"index_run{run_idx}"
+            suffix = "_reorder" if args.append_reorder_data else ""
+            prefix = run_root / isa / f"index_run{run_idx}{suffix}"
             _rm_prefix_outputs(prefix)
             cmd_args = build_common_cli(prefix)
             log_path = run_root / isa / f"run{run_idx}.log"

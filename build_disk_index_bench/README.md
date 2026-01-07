@@ -9,6 +9,11 @@ Benchmarks DiskANN `build_disk_index` build time by running two separate DiskANN
 
 Both are expected to contain `apps/build_disk_index`.
 
+When using the wrapper `run_build_disk_index_bench.sh`, reorder is enabled by default and disk PQ is enabled with a default `--pq-disk-bytes` value.
+
+- Override reorder default: set `DISKANN_BDI_WITH_REORDER=0`
+- Override PQ bytes default: set `DISKANN_BDI_PQ_DISK_BYTES=<N>` (or pass `--pq-disk-bytes <N>`)
+
 ## Usage
 
 From this folder:
@@ -31,6 +36,8 @@ source ../env.sh
 ```
 
 Outputs (indexes + logs) are written under `build_disk_index_bench/runs/`.
+
+If you enable reorder data (`--with-reorder` / `--append-reorder-data`), the generated index prefix includes a `_reorder` suffix (e.g. `index_run0_reorder_disk.index`) so you can keep both reorder and non-reorder indexes.
 
 If you need synthetic `.bin` data, use the shared generator in `diskann-pg/bench_data/`:
 
@@ -102,6 +109,9 @@ This benchmark runner ultimately executes DiskANN’s `apps/build_disk_index` tw
 - `--append-reorder-data`
   - Meaning: include full-precision reorder data in the disk index (only relevant when using disk PQ).
   - Maps to DiskANN: `--append_reorder_data`
+- `--with-reorder`
+  - Meaning: alias for `--append-reorder-data`.
+  - Requirement: must also pass `--pq-disk-bytes <N>` where `N > 0`.
 - `--codebook-prefix`
   - Meaning: path prefix for a pre-trained codebook.
   - Maps to DiskANN: `--codebook_prefix`

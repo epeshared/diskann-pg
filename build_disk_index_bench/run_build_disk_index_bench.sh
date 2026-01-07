@@ -13,17 +13,24 @@ DEFAULT_DIST_FN=${DISKANN_BDI_DIST_FN:-mips}
 DEFAULT_DATA_PATH=${DISKANN_BDI_DATA_PATH:-/home/xtang/diskann-pg/bench_data/tmpdata/base_1536_bf16_1M.bin}
 DEFAULT_SEARCH_DRAM_BUDGET=${DISKANN_BDI_SEARCH_DRAM_BUDGET:-64}
 DEFAULT_BUILD_DRAM_BUDGET=${DISKANN_BDI_BUILD_DRAM_BUDGET:-64}
-DEFAULT_NUM_THREADS=${DISKANN_BDI_NUM_THREADS:-32}
+DEFAULT_NUM_THREADS=${DISKANN_BDI_NUM_THREADS:-64}
 DEFAULT_MAX_DEGREE=${DISKANN_BDI_MAX_DEGREE:-64}
 DEFAULT_LBUILD=${DISKANN_BDI_LBUILD:-100}
-DEFAULT_RUNS=${DISKANN_BDI_RUNS:-3}
+DEFAULT_RUNS=${DISKANN_BDI_RUNS:-1}
+DEFAULT_WITH_REORDER=${DISKANN_BDI_WITH_REORDER:-1}
+DEFAULT_PQ_DISK_BYTES=${DISKANN_BDI_PQ_DISK_BYTES:-64}
 
 # If the user did not pass --data-path, ensure the default path exists.
 has_data_path=0
+has_pq_disk_bytes=0
+has_reorder_flag=0
 for arg in "$@"; do
 	if [[ "$arg" == "--data-path" ]]; then
 		has_data_path=1
-		break
+	elif [[ "$arg" == "--pq-disk-bytes" ]]; then
+		has_pq_disk_bytes=1
+	elif [[ "$arg" == "--append-reorder-data" || "$arg" == "--with-reorder" ]]; then
+		has_reorder_flag=1
 	fi
 done
 
@@ -33,6 +40,23 @@ if [[ $has_data_path -eq 0 ]]; then
 		echo "Set DISKANN_BDI_DATA_PATH or pass --data-path <file>." >&2
 		exit 2
 	fi
+fi
+
+EXTRA_FLAGS=()
+if [[ "$DEFAULT_WITH_REORDER" == "1" && $has_reorder_flag -eq 0 ]]; then
+	EXTRA_FLAGS+=("--with-reorder")
+	has_reorder_flag=1
+fi
+
+if [[ $has_pq_disk_bytes -eq 0 ]]; then
+	EXTRA_FLAGS+=("--pq-disk-bytes" "$DEFAULT_PQ_DISK_BYTES")
+	has_pq_disk_bytes=1
+fi
+
+if [[ $has_reorder_flag -eq 1 && $has_pq_disk_bytes -eq 0 ]]; then
+	echo "ERROR: reorder index build requires disk PQ. Please pass --pq-disk-bytes <N> (N>0)." >&2
+	echo "  Example: ./run_build_disk_index_bench.sh --pq-disk-bytes 64 --with-reorder" >&2
+	exit 2
 fi
 
 exec python3 "$SCRIPT_DIR/bench_build_disk_index.py" \
@@ -45,4 +69,5 @@ exec python3 "$SCRIPT_DIR/bench_build_disk_index.py" \
 	--max-degree "$DEFAULT_MAX_DEGREE" \
 	--lbuild "$DEFAULT_LBUILD" \
 	--runs "$DEFAULT_RUNS" \
+	"${EXTRA_FLAGS[@]}" \
 	"$@"

@@ -11,18 +11,16 @@
 
 它会：
 
-- 输入 float32 的 base/query（DiskANN `.bin` 格式）
-- 自动生成 bf16/int8 版本的数据文件（chunked 转换，不要求一次性加载到内存）
-- 对 float/bf16：构建 `PQ_disk_bytes>0 + append_reorder_data` 的 disk index，并在 search 时开启 `use_reorder_data`
-- 对 int8：DiskANN 目前不支持 reorder（`search_disk_index`/`build_disk_index` 会报错），因此会跑 **PQ-only** 的 disk index
-- 产出每个 dtype 的 build/search 时间、search 输出表格解析，以及 `summary.json`
+- **只做 search**：对指定的 dtype（float/bf16/int8）调用 `search_disk_index`
+- index 和 query 数据来自你指定的 `--run-root` 目录（由 `build_disk_index` 事先生成）
+- 产出每个 dtype 的 search 时间、search 输出表格解析，以及 `summary.json`
 
 > 注意：DiskANN 的 **reorder data**（也就是 `append_reorder_data`/`use_reorder_data`）目前只支持 `float/bf16`。
 > 所以本 benchmark 的 int8 路径是 **PQ-only**（仍然会 build/search，但不会启用 reorder）。
 
 ---
 
-## 1) 如何运行
+## 1) 如何运行（search-only）
 
 ### 1.1 前置条件
 
@@ -43,19 +41,51 @@ pip install numpy
 - 后面：`npts * dim` 个元素
 - 这里必须是 float32（`--base-f32` / `--query-f32` 都是 float32）
 
-如果你没有数据，可用 DiskANN 自带的 `rand_data_gen` 生成：
+如果你需要生成一些可复现的 `.bin` 数据，可用共享脚本：
 
 ```bash
-cd diskann-pg/pq_reorder_bench
+cd diskann-pg/bench_data
 
-# 这个脚本会调用 diskann-pg/bench_data/generate_data.sh
 ./generate_data.sh --dim 768 --base-n 1000000 --query-n 10000
 
-# 输出在：diskann-pg/pq_reorder_bench/tmpdata/
+# 输出在：diskann-pg/bench_data/tmpdata/
 # 例如：tmpdata/base_768_f32_1M.bin / tmpdata/query_768_f32_10K.bin
 ```
 
-### 1.3 最常用运行方式（推荐）
+> 注意：本 benchmark 不再负责 build。你需要先用 `build_disk_index` 在某个目录下生成 disk index。
+
+### 1.3 `--index-root` / `--query-file`
+
+`--index-root` 需要包含：
+
+- `<index-root>/<dtype>/index/*_disk.index`（以及同前缀的其它 index 文件）
+
+你需要指定一个 `--query-file`（某个具体的 query `.bin` 文件）。
+
+脚本启动时会检查该文件的元素大小（通过 header + 文件大小推断）是否和 `--dtypes` 匹配：
+
+- `float` -> 4 bytes
+- `bf16` -> 2 bytes
+- `int8` -> 1 byte
+
+例如 query 数据在 `diskann-pg/build_disk_index_bench/data/1M/`：
+
+```bash
+./run_pq_reorder_bench.sh \
+  --index-root /path/to/index_root \
+  --query-file /home/xtang/diskann-pg/build_disk_index_bench/data/1M/query_1536_bf16_10K.bin \
+  --dtypes bf16 \
+  --dist l2 \
+  --K 10 \
+  --Ls 100 \
+  --threads 32
+```
+
+可选：
+
+- `<run-root>/gt/gt_float_K<K>.bin`（如果存在，会自动传给 `search_disk_index` 以打印 recall）
+
+### 1.4 最常用运行方式（推荐）
 
 用 wrapper 脚本：
 
@@ -68,30 +98,28 @@ chmod +x run_pq_reorder_bench.sh
 
 ./run_pq_reorder_bench.sh \
   --isa avx512 \
-  --base-f32 tmpdata/base_768_f32_1M.bin \
-  --query-f32 tmpdata/query_768_f32_10K.bin \
+  --run-root /path/to/run_root \
+  --dtypes bf16 \
   --dist l2 \
   --K 10 \
   --Ls 10 20 30 40 50 100 \
-  --PQ-disk-bytes 32 \
   --threads 32
 ```
 
 运行成功后会在 stdout 打印一个路径，指向本次 run 的 `summary.json`。
 
-### 1.4 直接运行 Python（更灵活）
+### 1.5 直接运行 Python（更灵活）
 
 ```bash
 cd diskann-pg/pq_reorder_bench
 
 python3 pq_reorder_bench.py \
   --diskann-apps /home/xtang/DiskANN-epeshared/build/apps \
-  --base-f32 tmpdata/base_768_f32_1M.bin \
-  --query-f32 tmpdata/query_768_f32_10K.bin \
+  --run-root /path/to/run_root \
+  --dtypes bf16 \
   --dist l2 \
   --K 10 \
   --Ls 10 20 30 \
-  --PQ-disk-bytes 32 \
   --threads 32
 ```
 
@@ -159,7 +187,7 @@ python3 pq_reorder_bench.py \
 
 脚本的策略：
 
-- dtype=float/bf16：search 时会加 `--use_reorder_data`（启用 PQ+reorder）。
+- dtype=float/bf16：如果 index 里确实包含 reorder data，则 search 时会加 `--use_reorder_data`（启用 PQ+reorder）；否则自动退化为 PQ-only。
 - dtype=int8：不会加 `--use_reorder_data`（PQ-only）。
 
 ### 2.5 数据转换（float32 -> bf16 / int8）
@@ -260,8 +288,8 @@ cd diskann-pg/pq_reorder_bench
 chmod +x run_pq_reorder_bench.sh
 
 ./run_pq_reorder_bench.sh \
-  --base-f32 tmpdata/base_768_f32_1M.bin \
-  --query-f32 tmpdata/query_768_f32_10K.bin \
+  --base-f32 ../bench_data/tmpdata/base_768_f32_1M.bin \
+  --query-f32 ../bench_data/tmpdata/query_768_f32_10K.bin \
   --dist l2 \
   --K 10 \
   --Ls 10 20 30 40 50 100 \
