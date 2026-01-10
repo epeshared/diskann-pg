@@ -15,6 +15,8 @@
 
 - `pip install -r requirements.txt`
 
+建议在本 repo 的虚拟环境里安装/运行（默认路径：`/home/xtang/diskann-pg/.venv`）。
+
 或手动安装：
 
 - `pip install numpy h5py matplotlib`
@@ -66,7 +68,7 @@ dbpedia 的 HDF5 keys（已验证）:
   --data-path ./dbpedia_bins/train.bf16.bin \
   --index-prefix ./dbpedia_index/dbpedia_bf16_cosine \
   --dist cosine --dtype bf16 --threads 32 \
-  --B 4 --M 32 --R 64 --Lbuild 100
+  --B 4 --M 32 --max-degree 64 --Lbuild 100
 ```
 
 完成后会生成：
@@ -81,6 +83,24 @@ dbpedia 的 HDF5 keys（已验证）:
   --index-prefix ./dbpedia_index/dbpedia_bf16_cosine \
   --dist cosine --dtype bf16 --K 10 \
   --Ls 50 100 150 200 --Ws 2 4 8 --threads 32
+
+## 合并：如果同样的 max-degree/Lbuild 已存在就复用
+
+如果你希望把“build_disk_index + run_recall_sweep”合成一步，并且当相同的 `--max-degree` + `--Lbuild` 已经建过索引时直接复用，可以用：
+
+```bash
+./run_build_and_recall_sweep.sh \
+  --dataset /mnt/nvme2n1p1/xtang/ann-data/dbpedia-openai-1000k-angular.hdf5 \
+  --bins-dir ./dbpedia_bins \
+  --dist cosine --dtype bf16 --threads 32 \
+  --B 4 --M 32 --max-degree 64 --Lbuild 100 \
+  --K 10 --Ls 50 100 150 200 --Ws 2 4 8
+```
+
+输出目录默认在 `./runs/`：
+
+- 索引 cache：`runs/index_cache/<dataset>/<dtype>/<dist>/maxdeg_<...>_Lbuild_<...>/index_disk.index`
+- sweep 输出：`runs/sweeps/<timestamp>_.../summary.csv` 和 `recall_heatmap.png`
 ```
 
 运行结束后会生成：
@@ -88,6 +108,7 @@ dbpedia 的 HDF5 keys（已验证）:
 - `runs/<timestamp>/summary.csv`
 - `runs/<timestamp>/recall_heatmap.png`（当同时 sweep 多个 L 和多个 W）
   - 否则输出 `runs/<timestamp>/recall_curve.png`
+- `runs/<timestamp>/qps_vs_recall_at.png`（横轴 recall_at(K)，纵轴 QPS；每条曲线对应一组 L/W）
 
 ## 参数说明
 
@@ -98,6 +119,7 @@ dbpedia 的 HDF5 keys（已验证）:
 - `--data-type`：`float|bf16|int8`（会从 HDF5 queries 自动生成对应 dtype 的 `.bin` 查询文件）
 - `--dist`：`l2|mips|cosine`
 - `--K`：计算 Recall@K，同时作为 `search_disk_index --recall_at`
+- `--recall-ats`：可选，sweep 多个 recall_at(K) 值；用于生成 `qps_vs_recall_at.png`
 - `--Ls`：要 sweep 的 `search_list` 参数列表（每个 L 都会输出结果，并计算召回率）
 - `--Ws`：要 sweep 的 `beamwidth` 列表（每个 W 会单独运行一次 `search_disk_index`）
 - 其它：`--threads`、`--num-nodes-to-cache`、`--search-io-limit`、`--use-reorder-data`

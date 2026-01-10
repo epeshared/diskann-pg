@@ -20,7 +20,7 @@ B_SEARCH_DRAM_GB="4"   # search_DRAM_budget
 M_BUILD_DRAM_GB="32"   # build_DRAM_budget
 
 # Optional build params
-R=64
+MAX_DEGREE=64
 LBUILD=100
 PQ_DISK_BYTES=0
 APPEND_REORDER=0
@@ -38,7 +38,7 @@ Options:
   --threads <t>                    Default: nproc
   --B <gb>                         search_DRAM_budget (required by DiskANN) default: 4
   --M <gb>                         build_DRAM_budget (required by DiskANN)  default: 32
-  --R <deg>                        max_degree default: 64
+  --max-degree <deg>               max degree (graph out-degree) default: 64
   --Lbuild <L>                     Lbuild default: 100
   --PQ-disk-bytes <n>              PQ_disk_bytes default: 0
   --append-reorder-data            Enable append_reorder_data (requires PQ-disk-bytes > 0)
@@ -82,7 +82,8 @@ while [[ $# -gt 0 ]]; do
     --B) B_SEARCH_DRAM_GB="$2"; shift 2;;
     --M) M_BUILD_DRAM_GB="$2"; shift 2;;
 
-    --R) R="$2"; shift 2;;
+    --max-degree) MAX_DEGREE="$2"; shift 2;;
+    --R) MAX_DEGREE="$2"; shift 2;;
     --Lbuild|--L) LBUILD="$2"; shift 2;;
     --PQ-disk-bytes) PQ_DISK_BYTES="$2"; shift 2;;
     --append-reorder-data) APPEND_REORDER=1; shift;;
@@ -115,7 +116,7 @@ CMD=(
   --search_DRAM_budget "$B_SEARCH_DRAM_GB"
   --build_DRAM_budget "$M_BUILD_DRAM_GB"
   --num_threads "$THREADS"
-  --max_degree "$R"
+  --max_degree "$MAX_DEGREE"
   --Lbuild "$LBUILD"
   --PQ_disk_bytes "$PQ_DISK_BYTES"
 )

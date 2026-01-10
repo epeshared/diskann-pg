@@ -4,7 +4,12 @@ set -euo pipefail
 # Minimal wrapper to run recall_sweep_disk_index.py with sane defaults.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY=${PYTHON:-python3}
+DEFAULT_PY="$ROOT_DIR/../.venv/bin/python"
+if [[ -x "$DEFAULT_PY" ]]; then
+  PY=${PYTHON:-$DEFAULT_PY}
+else
+  PY=${PYTHON:-python3}
+fi
 
 DATASET=""
 INDEX_PREFIX=""
@@ -13,6 +18,7 @@ SEARCH_BIN=""
 DIST="cosine"
 DTYPE="bf16"
 K=10
+RECALL_ATS=()
 THREADS="$(nproc)"
 NUM_NODES_TO_CACHE=0
 
@@ -22,6 +28,11 @@ WS_LIST=(2 4 8)
 OUT_DIR=""
 USE_REORDER=0
 IO_LIMIT=""
+
+MAX_DEGREE=""
+LBUILD=""
+B_SEARCH_DRAM_GB=""
+M_BUILD_DRAM_GB=""
 
 usage() {
   cat <<'EOF'
@@ -34,12 +45,17 @@ Options:
   --dist <l2|mips|cosine>    Default: cosine
   --dtype <float|bf16|int8>  Default: bf16
   --K <k>                    Default: 10
+  --recall-ats <k1 k2 ...>    Optional; sweep multiple recall_at values
   --Ls <l1 l2 ...>           Default: 50 100 150 200
   --Ws <w1 w2 ...>           Default: 2 4 8
   --threads <t>              Default: nproc
   --num-nodes-to-cache <n>   Default: 0
   --search-io-limit <n>      Optional
   --use-reorder-data         Pass --use_reorder_data to search_disk_index
+  --max-degree <n>            Index build max degree (reported in outputs)
+  --Lbuild <n>                Index build Lbuild (reported in outputs)
+  --B <gb>                    Index build search_DRAM_budget (reported in outputs)
+  --M <gb>                    Index build build_DRAM_budget (reported in outputs)
   --out-dir <dir>            Optional; default: recall_eval/runs/<timestamp>
 
 Example:
@@ -62,6 +78,14 @@ while [[ $# -gt 0 ]]; do
     --dist) DIST="$2"; shift 2;;
     --dtype|--data-type) DTYPE="$2"; shift 2;;
     --K) K="$2"; shift 2;;
+    --recall-ats)
+      shift
+      RECALL_ATS=()
+      while [[ $# -gt 0 && "$1" != -* ]]; do
+        RECALL_ATS+=("$1")
+        shift
+      done
+      ;;
 
     --Ls)
       shift
@@ -87,6 +111,11 @@ while [[ $# -gt 0 ]]; do
     --use-reorder-data) USE_REORDER=1; shift;;
     --out-dir) OUT_DIR="$2"; shift 2;;
 
+    --max-degree) MAX_DEGREE="$2"; shift 2;;
+    --Lbuild) LBUILD="$2"; shift 2;;
+    --B) B_SEARCH_DRAM_GB="$2"; shift 2;;
+    --M) M_BUILD_DRAM_GB="$2"; shift 2;;
+
     --help|-h) usage; exit 0;;
     *) die "Unknown arg: $1";;
   esac
@@ -108,6 +137,10 @@ CMD=(
   --num-nodes-to-cache "$NUM_NODES_TO_CACHE"
 )
 
+if [[ ${#RECALL_ATS[@]} -gt 0 ]]; then
+  CMD+=(--recall-ats "${RECALL_ATS[@]}")
+fi
+
 if [[ -n "$SEARCH_BIN" ]]; then
   CMD+=(--search-bin "$SEARCH_BIN")
 fi
@@ -118,6 +151,19 @@ fi
 
 if [[ "$USE_REORDER" -eq 1 ]]; then
   CMD+=(--use-reorder-data)
+fi
+
+if [[ -n "$MAX_DEGREE" ]]; then
+  CMD+=(--max-degree "$MAX_DEGREE")
+fi
+if [[ -n "$LBUILD" ]]; then
+  CMD+=(--Lbuild "$LBUILD")
+fi
+if [[ -n "$B_SEARCH_DRAM_GB" ]]; then
+  CMD+=(--B "$B_SEARCH_DRAM_GB")
+fi
+if [[ -n "$M_BUILD_DRAM_GB" ]]; then
+  CMD+=(--M "$M_BUILD_DRAM_GB")
 fi
 
 if [[ -n "$OUT_DIR" ]]; then
